@@ -6,13 +6,14 @@ This repository contains a retail data analysis project for the STATS 765 course
 The project uses R to process, explore, and analyse retail-related data, with a focus on data preparation, variable relationships, and sales forecasting ideas.
 
 ## Repository Structure and Code Description
-
+'''
 RetailAnalysis/
 ├── Reanalyze/
 ├── sales_forecasting_model/
 ├── DataProcess.R
 ├── ForCorr.R
 └── README.md
+'''
 
 ## Code Description
 
