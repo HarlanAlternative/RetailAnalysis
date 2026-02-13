@@ -1,0 +1,404 @@
+# Milestone 3: Sales Forecasting Analysis
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+```
+
+
+## Data Loading and Setup
+
+```{r load-data}
+# Load required libraries
+library(tidyverse)
+library(arrow)
+library(forecast)
+library(randomForest)
+library(xgboost)
+library(ggplot2)
+library(slider)
+library(furrr)
+library(parallel)
+library(R.utils)
+
+# Set working directory and create output folders
+setwd("/Users/lihaoranscomputer/Desktop/for765/project/newTryM3")
+dir.create("figures", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+dir.create("logs", showWarnings = FALSE)
+
+# Set seed for reproducibility
+set.seed(765)
+plan(multisession, workers = parallel::detectCores() - 1)
+
+# Load processed data
+panel_data <- read_parquet('data_processed/panel.parquet')
+
+# Data overview
+cat("Dataset dimensions:", dim(panel_data), "\n")
+cat("Number of stores:", length(unique(panel_data$store)), "\n")
+cat("Time period:", min(panel_data$week), "to", max(panel_data$week), "weeks\n")
+```
+
+## Feature Engineering
+
+```{r feature-engineering}
+# Create time-based and lag features
+featured_data <- panel_data %>%
+  arrange(store, week) %>%
+  group_by(store) %>%
+  mutate(
+    # Time features
+    year = floor(week / 52) + 2005,
+    month = ((week - 1) %% 52) %/% 4 + 1,
+    quarter = ceiling(month / 3),
+    is_holiday_season = month %in% c(11, 12, 1, 2),
+    
+    # Lag features
+    units_lag1 = lag(units, 1),
+    units_lag2 = lag(units, 2),
+    units_lag4 = lag(units, 4),
+    
+    # Moving averages
+    units_ma4 = slider::slide_dbl(units, mean, .before = 3, .complete = TRUE),
+    units_ma12 = slider::slide_dbl(units, mean, .before = 11, .complete = TRUE),
+    
+    # Price features
+    price_change = avg_price - lag(avg_price, 1),
+    price_ma4 = slider::slide_dbl(avg_price, mean, .before = 3, .complete = TRUE),
+    
+    # Seasonal features
+    sin_week = sin(2 * pi * week / 52),
+    cos_week = cos(2 * pi * week / 52),
+    sin_month = sin(2 * pi * month / 12),
+    cos_month = cos(2 * pi * month / 12)
+  ) %>%
+  ungroup() %>%
+  # Handle missing values
+  mutate(
+    units_lag1 = ifelse(is.na(units_lag1), 0, units_lag1),
+    units_lag2 = ifelse(is.na(units_lag2), 0, units_lag2),
+    units_lag4 = ifelse(is.na(units_lag4), 0, units_lag4),
+    price_change = ifelse(is.na(price_change), 0, price_change)
+  )
+
+# Select key features for modeling
+key_features <- c("units", "avg_price", "units_lag1", "units_lag2", "units_lag4", 
+                  "units_ma4", "units_ma12", "price_change", "price_ma4",
+                  "sin_month", "cos_month", "sin_week", "cos_week", "is_holiday_season",
+                  "month", "quarter", "store", "week")
+
+model_data <- featured_data %>%
+  filter(!is.na(units), !is.na(avg_price)) %>%
+  select(all_of(intersect(key_features, colnames(featured_data))))
+
+cat("Final dataset dimensions:", dim(model_data), "\n")
+```
+
+## Data Splitting
+
+```{r data-split}
+# Time-based split to prevent data leakage
+train_weeks <- 1:320
+test_weeks <- 321:399
+
+train_data <- model_data %>% filter(week %in% train_weeks)
+test_data <- model_data %>% filter(week %in% test_weeks)
+
+cat("Training set:", nrow(train_data), "observations\n")
+cat("Test set:", nrow(test_data), "observations\n")
+cat("Split ratio:", round(nrow(train_data)/nrow(model_data)*100, 1), "% training\n")
+```
+
+## Model 1: Random Forest
+
+```{r random-forest}
+# Prepare data
+rf_features <- setdiff(colnames(model_data), c("units", "store", "week"))
+rf_train <- train_data %>%
+  select(all_of(rf_features)) %>%
+  mutate_if(is.character, as.factor) %>%
+  mutate_if(is.logical, as.numeric) %>%
+  mutate_all(~ifelse(is.na(.), 0, .))
+
+rf_test <- test_data %>%
+  select(all_of(rf_features)) %>%
+  mutate_if(is.character, as.factor) %>%
+  mutate_if(is.logical, as.numeric) %>%
+  mutate_all(~ifelse(is.na(.), 0, .))
+
+# Train model
+rf_model <- randomForest(
+  x = rf_train,
+  y = train_data$units,
+  ntree = 100,
+  mtry = sqrt(ncol(rf_train)),
+  importance = TRUE
+)
+
+# Predictions and evaluation
+rf_predictions <- predict(rf_model, rf_test)
+rf_rmse <- sqrt(mean((test_data$units - rf_predictions)^2))
+rf_mae <- mean(abs(test_data$units - rf_predictions))
+rf_mape <- mean(abs((test_data$units - rf_predictions) / test_data$units)) * 100
+
+# Feature importance
+rf_importance <- importance(rf_model)
+rf_importance_df <- data.frame(
+  feature = rownames(rf_importance),
+  IncNodePurity = rf_importance[, "IncNodePurity"],
+  IncMSE = rf_importance[, "%IncMSE"]
+) %>%
+  arrange(desc(IncNodePurity))
+
+cat("Random Forest Results:\n")
+cat("RMSE:", round(rf_rmse, 3), "\n")
+cat("MAE:", round(rf_mae, 3), "\n")
+cat("MAPE:", round(rf_mape, 3), "%\n")
+```
+
+## Model 2: XGBoost
+
+```{r xgboost}
+# Prepare data
+xgb_train <- train_data %>%
+  select(all_of(rf_features)) %>%
+  mutate_if(is.character, as.numeric) %>%
+  mutate_if(is.logical, as.numeric) %>%
+  mutate_all(~ifelse(is.na(.), 0, .)) %>%
+  as.matrix()
+
+xgb_test <- test_data %>%
+  select(all_of(rf_features)) %>%
+  mutate_if(is.character, as.numeric) %>%
+  mutate_if(is.logical, as.numeric) %>%
+  mutate_all(~ifelse(is.na(.), 0, .)) %>%
+  as.matrix()
+
+# Train model
+xgb_model <- xgboost(
+  data = xgb_train,
+  label = train_data$units,
+  nrounds = 100,
+  max_depth = 6,
+  eta = 0.1,
+  objective = "reg:squarederror",
+  nthread = 1,
+  verbose = 0
+)
+
+# Predictions and evaluation
+xgb_predictions <- predict(xgb_model, xgb_test)
+xgb_rmse <- sqrt(mean((test_data$units - xgb_predictions)^2))
+xgb_mae <- mean(abs(test_data$units - xgb_predictions))
+xgb_mape <- mean(abs((test_data$units - xgb_predictions) / test_data$units)) * 100
+
+# Feature importance
+xgb_importance <- xgb.importance(feature_names = colnames(xgb_train), model = xgb_model)
+
+cat("XGBoost Results:\n")
+cat("RMSE:", round(xgb_rmse, 3), "\n")
+cat("MAE:", round(xgb_mae, 3), "\n")
+cat("MAPE:", round(xgb_mape, 3), "%\n")
+```
+
+## Model 3: ARIMA (Optimized)
+
+```{r arima-optimized}
+# Define evaluation metrics
+smape <- function(a, f) mean(2 * abs(f - a) / (abs(a) + abs(f)), na.rm = TRUE)
+mase <- function(a, f, insample) {
+  q <- mean(abs(diff(insample)), na.rm = TRUE)
+  mean(abs(a - f) / q, na.rm = TRUE)
+}
+
+# Optimized ARIMA function with timeout
+fit_predict_store <- function(df_train, df_test) {
+  y_tr <- ts(df_train$units, frequency = 52)
+  
+  if (length(y_tr) < 80) stop("too_few_points")
+  
+  # Try pure time series first
+  tryCatch({
+    pred <- withTimeout({
+      fit <- forecast::auto.arima(
+        y_tr, seasonal = TRUE, stepwise = TRUE, approximation = TRUE,
+        max.p = 3, max.q = 3, max.P = 1, max.Q = 1, max.order = 5,
+        d = NA, D = NA, allowdrift = TRUE, allowmean = TRUE
+      )
+      as.numeric(forecast::forecast(fit, h = nrow(df_test))$mean)
+    }, timeout = 20, onTimeout = "error")
+    return(list(pred = pred, method = "auto.arima_pure"))
+  }, error = function(e1) {
+    # Fallback to seasonal naive
+    fc <- forecast::snaive(y_tr, h = nrow(df_test))
+    return(list(pred = as.numeric(fc$mean), method = "snaive"))
+  })
+}
+
+# Process stores in batches
+stores <- sort(unique(model_data$store))
+chunks <- split(stores, ceiling(seq_along(stores)/20))
+pred_arima_list <- list()
+
+cat("Processing ARIMA for", length(stores), "stores in", length(chunks), "batches...\n")
+
+for (i in seq_along(chunks)) {
+  chs <- chunks[[i]]
+  batch_data <- model_data[model_data$store %in% chs, ]
+  
+  batch_results <- furrr::future_map(
+    split(batch_data, batch_data$store),
+    function(df) {
+      tr <- subset(df, week %in% train_weeks)
+      te <- subset(df, week %in% test_weeks)
+      
+      tryCatch({
+        result <- fit_predict_store(tr, te)
+        te$pred_arima <- result$pred
+        te$arima_method <- result$method
+        te
+      }, error = function(e) {
+        # Fallback to simple mean
+        te$pred_arima <- rep(mean(tr$units, na.rm = TRUE), nrow(te))
+        te$arima_method <- "simple_mean"
+        te
+      })
+    },
+    .progress = TRUE
+  )
+  
+  pred_arima_list <- c(pred_arima_list, batch_results)
+}
+
+# Combine results
+arima_predictions_df <- do.call(rbind, pred_arima_list)
+
+# Calculate metrics
+arima_rmse <- sqrt(mean((arima_predictions_df$units - arima_predictions_df$pred_arima)^2, na.rm = TRUE))
+arima_mae <- mean(abs(arima_predictions_df$units - arima_predictions_df$pred_arima), na.rm = TRUE)
+arima_mape <- mean(abs((arima_predictions_df$units - arima_predictions_df$pred_arima) / arima_predictions_df$units), na.rm = TRUE) * 100
+
+cat("ARIMA Results:\n")
+cat("RMSE:", round(arima_rmse, 3), "\n")
+cat("MAE:", round(arima_mae, 3), "\n")
+cat("MAPE:", round(arima_mape, 3), "%\n")
+cat("Stores processed:", length(unique(arima_predictions_df$store)), "\n")
+```
+
+## Seasonal Naive Baseline
+
+```{r seasonal-naive}
+# Generate seasonal naive predictions
+snaive_predictions_list <- lapply(split(model_data, model_data$store), function(df) {
+  tr <- subset(df, week %in% train_weeks)
+  te <- subset(df, week %in% test_weeks)
+  
+  if(nrow(tr) > 52 && nrow(te) > 0) {
+    y_tr <- ts(tr$units, frequency = 52)
+    tryCatch({
+      te$pred_snaive <- as.numeric(forecast::snaive(y_tr, h = nrow(te))$mean)
+      te
+    }, error = function(e) {
+      te$pred_snaive <- rep(mean(tr$units, na.rm = TRUE), nrow(te))
+      te
+    })
+  } else {
+    NULL
+  }
+})
+
+snaive_predictions_df <- do.call(rbind, snaive_predictions_list)
+
+# Calculate metrics
+snaive_rmse <- sqrt(mean((snaive_predictions_df$units - snaive_predictions_df$pred_snaive)^2, na.rm = TRUE))
+snaive_mae <- mean(abs(snaive_predictions_df$units - snaive_predictions_df$pred_snaive), na.rm = TRUE)
+snaive_mape <- mean(abs((snaive_predictions_df$units - snaive_predictions_df$pred_snaive) / snaive_predictions_df$units), na.rm = TRUE) * 100
+
+cat("Seasonal Naive Results:\n")
+cat("RMSE:", round(snaive_rmse, 3), "\n")
+cat("MAE:", round(snaive_mae, 3), "\n")
+cat("MAPE:", round(snaive_mape, 3), "%\n")
+```
+
+## Model Comparison
+
+```{r model-comparison}
+# Create comparison table
+performance_comparison <- data.frame(
+  Model = c("Random Forest", "XGBoost", "ARIMA", "sNaive"),
+  RMSE = c(rf_rmse, xgb_rmse, arima_rmse, snaive_rmse),
+  MAE = c(rf_mae, xgb_mae, arima_mae, snaive_mae),
+  MAPE = c(rf_mape, xgb_mape, arima_mape, snaive_mape)
+)
+
+# Display results
+knitr::kable(performance_comparison, digits = 3, caption = "Model Performance Comparison")
+
+# Performance comparison plot
+performance_comparison %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(title = "Model Performance Comparison",
+       subtitle = "Lower values indicate better performance",
+       y = "Value", x = "Model") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Feature Importance Analysis
+
+```{r feature-importance}
+# Random Forest feature importance
+head(rf_importance_df, 10) %>%
+  ggplot(aes(x = reorder(feature, IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Random Forest Feature Importance",
+       subtitle = "Top 10 Most Important Features",
+       x = "Features", y = "IncNodePurity") +
+  theme_minimal()
+
+# XGBoost feature importance
+head(xgb_importance, 10) %>%
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "darkgreen", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "XGBoost Feature Importance",
+       subtitle = "Top 10 Most Important Features",
+       x = "Features", y = "Gain") +
+  theme_minimal()
+```
+
+## Prediction vs Actual Plots
+
+```{r prediction-plots}
+# Random Forest predictions
+data.frame(
+  Actual = test_data$units,
+  Predicted = rf_predictions
+) %>%
+  ggplot(aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Random Forest: Predicted vs Actual Sales",
+       subtitle = paste("RMSE:", round(rf_rmse, 2), "| MAE:", round(rf_mae, 2)),
+       x = "Actual Units", y = "Predicted Units") +
+  theme_minimal()
+
+# XGBoost predictions
+data.frame(
+  Actual = test_data$units,
+  Predicted = xgb_predictions
+) %>%
+  ggplot(aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "XGBoost: Predicted vs Actual Sales",
+       subtitle = paste("RMSE:", round(xgb_rmse, 2), "| MAE:", round(xgb_mae, 2)),
+       x = "Actual Units", y = "Predicted Units") +
+  theme_minimal()
+```
+
+
